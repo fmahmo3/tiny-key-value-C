@@ -16,3 +16,14 @@ mkdir build
 cd build
 cmake ..
 make
+
+## Command-line usage
+
+The CLI is built as `tinykv_cli`.
+
+Basic form:
+
+```bash
+tinykv_cli <db_path> <command [args...]>
+
+```
