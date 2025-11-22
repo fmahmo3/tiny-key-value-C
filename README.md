@@ -51,4 +51,40 @@ Exit Codes:
 - `0` on success
 - Non-zero on error (invalid usage, internal error, or key not found for `get`)
 
+## Append-Only On-Disk Persistence
 
+Same API and In-Memory Hash Table will be kept for now. New addition is a simple log file.
+
+### - File Format: Append-only log of records
+
+Each record on disk will be:
+
+```
+[1 byte op][4 bytes key_len][4 bytes value_len][key_bytes][value bytes]
+```
+
+- `op = 1` -> PUT
+- `op = 2` -> DELETE
+- `key_len` and `value_len` are `uint32_t`
+- For delete we do not need the value, so `value_len = 0`, no value bytes written.
+
+### - On Startup `kv_open`:
+- If `path == ":memory:"` -> purely in-memory, no file.
+- Otherwise:
+    - `fopen(path, "ab+")` (create file if missing, read+append)
+    - `replay_log()`:
+        - Seek to start
+        - Read every record
+        - For each:
+            - `PUT` -> apply internal kv_put to in-memory hash
+            - `DELETE` -> apply internal `kv_delete`
+        - Seek to end for future appends
+### - On `kv_put` / `kv_delete`:
+- If using a file:
+    - Append a record to the log (`write_log_record`)
+    - Flush it (`fflush`)
+- Then update the in-memory hash table
+
+### - On `kv_close`:
+- Flush and close file (if any)
+- Free all buckets/entries
