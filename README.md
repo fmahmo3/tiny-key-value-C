@@ -88,3 +88,7 @@ Each record on disk will be:
 ### - On `kv_close`:
 - Flush and close file (if any)
 - Free all buckets/entries
+
+### Persistence Summary
+
+The database file (`data.db`) is an append-only log. Each command that modifies data appends a record to this file. On startup, `tinykv` replays the log to reconstruct the in-memory state.

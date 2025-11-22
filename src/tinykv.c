@@ -2,6 +2,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdint.h>
 
 typedef struct kv_entry {
     char *key;
@@ -13,9 +15,20 @@ typedef struct kv_entry {
 struct kv_store {
     kv_entry_t **buckets;
     size_t bucket_count;
+
+    /* Persistence */
+    FILE *fp;
+    int is_memory_only;
 };
 
-/* Simple string hash (djb2) */
+#define TINYKV_DEFAULT_BUCKETS 1024
+
+/* Log record operation codes */
+#define TINYKV_OP_PUT    1
+#define TINYKV_OP_DELETE 2
+
+/* ---------- Hashing & internal helpers ---------- */
+
 static unsigned long hash_string(const char *s) {
     unsigned long hash = 5381;
     int c;
@@ -26,33 +39,7 @@ static unsigned long hash_string(const char *s) {
     return hash;
 }
 
-/* Choose a fixed bucket count for now. Later you can make this dynamic. */
-#define TINYKV_DEFAULT_BUCKETS 1024
-
-int kv_open(kv_store_t **out, const char *path) {
-    (void)path; /* Phase 2: ignore file path, purely in-memory */
-
-    if (!out) {
-        return -1;
-    }
-
-    kv_store_t *store = malloc(sizeof *store);
-    if (!store) {
-        return -1;
-    }
-
-    store->bucket_count = TINYKV_DEFAULT_BUCKETS;
-    store->buckets = calloc(store->bucket_count, sizeof *store->buckets);
-    if (!store->buckets) {
-        free(store);
-        return -1;
-    }
-
-    *out = store;
-    return 0;
-}
-
-/* Helper to find an entry by key (returns previous and current) */
+/* Helper to find an entry by key (returns bucket pointer, prev, and cur) */
 static void find_entry(kv_store_t *store,
                        const char *key,
                        kv_entry_t ***bucket_out,
@@ -100,7 +87,10 @@ static char *dup_string(const char *s) {
     return copy;
 }
 
-int kv_put(kv_store_t *store, const char *key, const void *value, size_t value_len) {
+/* ---------- Internal in-memory operations (no I/O) ---------- */
+
+static int kv_put_internal(kv_store_t *store, const char *key,
+                           const void *value, size_t value_len) {
     if (!store || !key || (!value && value_len > 0)) {
         return -1;
     }
@@ -123,7 +113,6 @@ int kv_put(kv_store_t *store, const char *key, const void *value, size_t value_l
             memcpy(new_value, value, value_len);
         }
 
-        /* Free old value and assign new */
         free(cur->value);
         cur->value = new_value;
         cur->value_len = value_len;
@@ -162,6 +151,212 @@ int kv_put(kv_store_t *store, const char *key, const void *value, size_t value_l
     return 0;
 }
 
+static int kv_delete_internal(kv_store_t *store, const char *key) {
+    if (!store || !key) {
+        return -1;
+    }
+
+    kv_entry_t **bucket = NULL;
+    kv_entry_t *prev = NULL;
+    kv_entry_t *cur = NULL;
+
+    find_entry(store, key, &bucket, &prev, &cur);
+
+    if (!cur) {
+        /* Not found: treat as no-op */
+        return 0;
+    }
+
+    if (prev) {
+        prev->next = cur->next;
+    } else {
+        *bucket = cur->next;
+    }
+
+    free(cur->key);
+    free(cur->value);
+    free(cur);
+
+    return 0;
+}
+
+/* ---------- Log file helpers ---------- */
+
+/* Write a single log record to the file (PUT or DELETE) */
+static int write_log_record(FILE *fp, uint8_t op,
+                            const char *key,
+                            const void *value, uint32_t value_len) {
+    if (!fp || !key) {
+        return -1;
+    }
+
+    uint32_t key_len = (uint32_t)strlen(key);
+
+    if (fwrite(&op, 1, 1, fp) != 1) {
+        return -1;
+    }
+    if (fwrite(&key_len, sizeof key_len, 1, fp) != 1) {
+        return -1;
+    }
+    if (fwrite(&value_len, sizeof value_len, 1, fp) != 1) {
+        return -1;
+    }
+    if (fwrite(key, 1, key_len, fp) != key_len) {
+        return -1;
+    }
+    if (value_len > 0) {
+        if (fwrite(value, 1, value_len, fp) != value_len) {
+            return -1;
+        }
+    }
+
+    if (fflush(fp) != 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+/* Replay the entire log file into the in-memory hash table */
+static int replay_log(kv_store_t *store) {
+    if (!store || !store->fp) {
+        return 0;
+    }
+
+    if (fseek(store->fp, 0, SEEK_SET) != 0) {
+        return -1;
+    }
+
+    for (;;) {
+        uint8_t op;
+        uint32_t key_len;
+        uint32_t value_len;
+
+        /* Try to read op; if we hit EOF cleanly, stop */
+        if (fread(&op, 1, 1, store->fp) != 1) {
+            break; /* EOF or partial record; treat as end of log */
+        }
+
+        if (fread(&key_len, sizeof key_len, 1, store->fp) != 1) {
+            break;
+        }
+        if (fread(&value_len, sizeof value_len, 1, store->fp) != 1) {
+            break;
+        }
+
+        char *key = malloc(key_len + 1);
+        if (!key) {
+            return -1;
+        }
+        if (fread(key, 1, key_len, store->fp) != key_len) {
+            free(key);
+            break;
+        }
+        key[key_len] = '\0';
+
+        void *value = NULL;
+        if (value_len > 0) {
+            value = malloc(value_len);
+            if (!value) {
+                free(key);
+                return -1;
+            }
+            if (fread(value, 1, value_len, store->fp) != value_len) {
+                free(key);
+                free(value);
+                break;
+            }
+        }
+
+        int rc = 0;
+        if (op == TINYKV_OP_PUT) {
+            rc = kv_put_internal(store, key, value, value_len);
+        } else if (op == TINYKV_OP_DELETE) {
+            rc = kv_delete_internal(store, key);
+        } else {
+            /* Unknown op: ignore */
+        }
+
+        free(key);
+        free(value);
+
+        if (rc != 0) {
+            return rc;
+        }
+    }
+
+    /* After replay, move file position to end for future appends */
+    (void)fseek(store->fp, 0, SEEK_END);
+    return 0;
+}
+
+/* ---------- Public API ---------- */
+
+int kv_open(kv_store_t **out, const char *path) {
+    if (!out || !path) {
+        return -1;
+    }
+
+    kv_store_t *store = malloc(sizeof *store);
+    if (!store) {
+        return -1;
+    }
+
+    store->bucket_count = TINYKV_DEFAULT_BUCKETS;
+    store->buckets = calloc(store->bucket_count, sizeof *store->buckets);
+    if (!store->buckets) {
+        free(store);
+        return -1;
+    }
+
+    store->fp = NULL;
+    store->is_memory_only = 0;
+
+    /* Special case: in-memory only (no file) */
+    if (strcmp(path, ":memory:") == 0) {
+        store->is_memory_only = 1;
+        *out = store;
+        return 0;
+    }
+
+    /* File-backed store */
+    FILE *fp = fopen(path, "ab+");
+    if (!fp) {
+        free(store->buckets);
+        free(store);
+        return -1;
+    }
+
+    store->fp = fp;
+
+    /* Replay existing log to reconstruct in-memory state */
+    if (replay_log(store) != 0) {
+        fclose(fp);
+        free(store->buckets);
+        free(store);
+        return -1;
+    }
+
+    *out = store;
+    return 0;
+}
+
+int kv_put(kv_store_t *store, const char *key, const void *value, size_t value_len) {
+    if (!store || !key || (!value && value_len > 0)) {
+        return -1;
+    }
+
+    /* First append to the log (if file-backed) */
+    if (!store->is_memory_only && store->fp) {
+        if (write_log_record(store->fp, TINYKV_OP_PUT, key, value, (uint32_t)value_len) != 0) {
+            return -1;
+        }
+    }
+
+    /* Then update in-memory state */
+    return kv_put_internal(store, key, value, value_len);
+}
+
 int kv_get(kv_store_t *store, const char *key, void **value, size_t *value_len) {
     if (!store || !key || !value || !value_len) {
         return -1;
@@ -174,8 +369,7 @@ int kv_get(kv_store_t *store, const char *key, void **value, size_t *value_len) 
     find_entry(store, key, &bucket, &prev, &cur);
 
     if (!cur) {
-        /* Key not found */
-        return -1;
+        return -1; /* not found */
     }
 
     if (cur->value_len == 0) {
@@ -201,34 +395,24 @@ int kv_delete(kv_store_t *store, const char *key) {
         return -1;
     }
 
-    kv_entry_t **bucket = NULL;
-    kv_entry_t *prev = NULL;
-    kv_entry_t *cur = NULL;
-
-    find_entry(store, key, &bucket, &prev, &cur);
-
-    if (!cur) {
-        /* Not found: treat as no-op, not an error */
-        return 0;
+    /* Log deletion (if file-backed). Value length is 0. */
+    if (!store->is_memory_only && store->fp) {
+        if (write_log_record(store->fp, TINYKV_OP_DELETE, key, NULL, 0) != 0) {
+            return -1;
+        }
     }
 
-    if (prev) {
-        prev->next = cur->next;
-    } else {
-        /* Deleting head of the list */
-        *bucket = cur->next;
-    }
-
-    free(cur->key);
-    free(cur->value);
-    free(cur);
-
-    return 0;
+    return kv_delete_internal(store, key);
 }
 
 void kv_close(kv_store_t *store) {
     if (!store) {
         return;
+    }
+
+    if (store->fp) {
+        fflush(store->fp);
+        fclose(store->fp);
     }
 
     for (size_t i = 0; i < store->bucket_count; ++i) {
