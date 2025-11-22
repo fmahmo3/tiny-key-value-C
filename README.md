@@ -51,12 +51,4 @@ Exit Codes:
 - `0` on success
 - Non-zero on error (invalid usage, internal error, or key not found for `get`)
 
-## 2. Turn `src/main.c` into a real CLI
 
-Now we make `main.c` handle commands instead of just printing a demo
-
-### 2.1 Open the file
-
-```bash
-nvim src/main.c
-```
