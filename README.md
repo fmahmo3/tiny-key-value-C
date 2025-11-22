@@ -28,3 +28,35 @@ Basic form:
 tinykv_cli <db_path> <command [args...]>
 
 ```
+
+Command examples:
+
+- Put a key value:
+
+```bash
+./tinykv data.db put user:1 '{"name":"Jacob"}'
+```
+
+- Get a value:
+```bash
+./tinykv_cli data.db get user:1
+```
+
+- Delete a key:
+```bash
+./tinykv_cli data.db delete user:1
+```
+
+Exit Codes:
+- `0` on success
+- Non-zero on error (invalid usage, internal error, or key not found for `get`)
+
+## 2. Turn `src/main.c` into a real CLI
+
+Now we make `main.c` handle commands instead of just printing a demo
+
+### 2.1 Open the file
+
+```bash
+nvim src/main.c
+```
